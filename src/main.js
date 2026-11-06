@@ -1,6 +1,4 @@
 import './style.css';
-// Используем легкую библиотеку для FFT прямо через CDN (не нужно ничего устанавливать)
-import FFT from 'https://unpkg.com/fft.js@4.0.4/lib/fft.js';
 
 const measureBtn = document.getElementById('measureBtn');
 const statusText = document.getElementById('status');
@@ -11,11 +9,59 @@ const SAMPLE_RATE = 48000;
 const SWEEP_DURATION = 2.0; 
 const SWEEP_START_FREQ = 20;
 const SWEEP_END_FREQ = 20000;
-const N_FFT = 8192; // Размер окна для инверсии (FIR)
+const N_FFT = 4096; // Размер FIR-фильтра
 
 let audioCtx = null;
 
-// Отрисовка двух графиков (оригинал и инверсия)
+// ==========================================
+// ВСТРОЕННЫЙ БЫСТРЫЙ FFT (Без библиотек)
+// ==========================================
+function fft(re, im) {
+  let n = re.length;
+  for (let i = 1, j = 0; i < n; i++) {
+    let bit = n >> 1;
+    for (; j & bit; bit >>= 1) j ^= bit;
+    j ^= bit;
+    if (i < j) {
+      let temp = re[i]; re[i] = re[j]; re[j] = temp;
+      temp = im[i]; im[i] = im[j]; im[j] = temp;
+    }
+  }
+  for (let len = 2; len <= n; len <<= 1) {
+    let ang = 2 * Math.PI / len;
+    let wlen_re = Math.cos(ang);
+    let wlen_im = Math.sin(ang);
+    for (let i = 0; i < n; i += len) {
+      let w_re = 1, w_im = 0;
+      for (let j = 0; j < len / 2; j++) {
+        let u_re = re[i + j], u_im = im[i + j];
+        let v_re = re[i + j + len / 2] * w_re - im[i + j + len / 2] * w_im;
+        let v_im = re[i + j + len / 2] * w_im + im[i + j + len / 2] * w_re;
+        re[i + j] = u_re + v_re;
+        im[i + j] = u_im + v_im;
+        re[i + j + len / 2] = u_re - v_re;
+        im[i + j + len / 2] = u_im - v_im;
+        let next_w_re = w_re * wlen_re - w_im * wlen_im;
+        w_im = w_re * wlen_im + w_im * wlen_re;
+        w_re = next_w_re;
+      }
+    }
+  }
+}
+
+function ifft(re, im) {
+  let n = re.length;
+  for (let i = 0; i < n; i++) im[i] = -im[i];
+  fft(re, im);
+  for (let i = 0; i < n; i++) {
+    re[i] /= n;
+    im[i] = -im[i] / n;
+  }
+}
+
+// ==========================================
+// ОТРИСОВКА И СИГНАЛЫ
+// ==========================================
 function drawPlots(irData, invData) {
   const w = canvas.width;
   const h = canvas.height;
@@ -23,15 +69,14 @@ function drawPlots(irData, invData) {
   ctx.fillStyle = '#000';
   ctx.fillRect(0, 0, w, h);
   
-  // Разделительная линия
   ctx.strokeStyle = '#333';
   ctx.beginPath();
   ctx.moveTo(0, h/2);
   ctx.lineTo(w, h/2);
   ctx.stroke();
 
-  // 1. Рисуем оригинальный импульс (верхняя половина)
-  ctx.strokeStyle = '#00e676'; // Зеленый
+  // Оригинальный импульс (Верх)
+  ctx.strokeStyle = '#00e676';
   ctx.lineWidth = 1.5;
   ctx.beginPath();
   const step1 = Math.max(1, Math.floor(irData.length / w));
@@ -45,8 +90,8 @@ function drawPlots(irData, invData) {
   }
   ctx.stroke();
 
-  // 2. Рисуем инверсный FIR (нижняя половина)
-  ctx.strokeStyle = '#00b0ff'; // Синий
+  // Инверсный FIR (Низ)
+  ctx.strokeStyle = '#00b0ff';
   ctx.beginPath();
   const step2 = Math.max(1, Math.floor(invData.length / w));
   for (let i = 0; i < w; i++) {
@@ -60,7 +105,6 @@ function drawPlots(irData, invData) {
   ctx.stroke();
 }
 
-// Генерация свипа
 function createSweep() {
   const length = Math.floor(SAMPLE_RATE * SWEEP_DURATION);
   const buffer = audioCtx.createBuffer(1, length, SAMPLE_RATE);
@@ -78,7 +122,6 @@ function createSweep() {
   return buffer;
 }
 
-// Создание обратного фильтра (Инверсный свип Фарана)
 function createInverseSweep(sweepBuffer) {
   const length = sweepBuffer.length;
   const invBuffer = audioCtx.createBuffer(1, length, SAMPLE_RATE);
@@ -86,7 +129,6 @@ function createInverseSweep(sweepBuffer) {
   const invData = invBuffer.getChannelData(0);
   
   for (let i = 0; i < length; i++) {
-    // Переворачиваем во времени и компенсируем АЧХ (экспоненциальное окно)
     const t = (length - 1 - i) / SAMPLE_RATE;
     const envelope = Math.exp(-t * Math.log(SWEEP_END_FREQ / SWEEP_START_FREQ) / SWEEP_DURATION);
     invData[i] = sweepData[length - 1 - i] * envelope;
@@ -94,11 +136,13 @@ function createInverseSweep(sweepBuffer) {
   return invBuffer;
 }
 
-// Главная математика: Деконволюция и расчет FIR
+// ==========================================
+// МАТЕМАТИКА
+// ==========================================
 async function processMeasurement(recordedData, sweepBuffer) {
   statusText.textContent = 'Деконволюция (расчет IR)...';
 
-  // 1. Деконволюция через встроенный OfflineAudioContext (Очень быстро!)
+  // 1. Деконволюция через OfflineAudioContext
   const invSweep = createInverseSweep(sweepBuffer);
   const offlineCtx = new OfflineAudioContext(1, recordedData.length + invSweep.length, SAMPLE_RATE);
   const recordNode = offlineCtx.createBufferSource();
@@ -117,69 +161,62 @@ async function processMeasurement(recordedData, sweepBuffer) {
   const renderedBuffer = await offlineCtx.startRendering();
   const irData = renderedBuffer.getChannelData(0);
 
-  // Находим пик (прямой звук) и обрезаем до N_FFT для FIR
+  // Находим пик (прямой звук)
   let maxIdx = 0;
   let maxVal = 0;
   for (let i = 0; i < irData.length; i++) {
     if (Math.abs(irData[i]) > maxVal) { maxVal = Math.abs(irData[i]); maxIdx = i; }
   }
   
-  // Вырезаем кусок вокруг пика
+  // Вырезаем кусок вокруг пика для FIR
   const startIdx = Math.max(0, maxIdx - 512);
-  const irSegment = irData.slice(startIdx, startIdx + N_FFT);
+  const irSegment = new Float32Array(N_FFT);
+  for(let i=0; i<N_FFT; i++) {
+      if(startIdx + i < irData.length) irSegment[i] = irData[startIdx + i];
+  }
   
-  // 2. Расчет инверсного FIR (Регуляризация)
+  // 2. Расчет инверсного FIR
   statusText.textContent = 'Расчет инверсного FIR...';
-  const fft = new FFT(N_FFT);
-  const out = fft.createComplexArray();
   
-  // Заполняем массив нулями
-  const inputRe = new Float32Array(N_FFT);
-  const inputIm = new Float32Array(N_FFT);
-  for(let i = 0; i < irSegment.length && i < N_FFT; i++) inputRe[i] = irSegment[i];
-  
-  fft.transform(out, Array.from(inputRe).flatMap((v, i) => [v, 0]));
+  const re = new Float32Array(N_FFT);
+  const im = new Float32Array(N_FFT);
+  for(let i=0; i<N_FFT; i++) re[i] = irSegment[i]; // Заполняем реальную часть
 
-  const invRe = new Float32Array(N_FFT);
-  const invIm = new Float32Array(N_FFT);
-  const beta = 0.001; // Параметр регуляризации (чем больше, тем меньше подъем НЧ)
+  fft(re, im); // Прямое FFT
 
+  const beta = 0.0001; // Регуляризация
   for (let i = 0; i < N_FFT; i++) {
-    const re = out[i * 2];
-    const im = out[i * 2 + 1];
-    const magSq = re * re + im * im;
+    const magSq = re[i] * re[i] + im[i] * im[i];
+    const invMagSq = 1.0 / (magSq + beta);
     
     // H_inv = conj(H) / (|H|^2 + beta)
-    invRe[i] = re / (magSq + beta);
-    invIm[i] = -im / (magSq + beta);
+    const temp_re = re[i] * invMagSq;
+    im[i] = -im[i] * invMagSq;
+    re[i] = temp_re;
   }
 
-  // Обратное FFT
-  const invOut = fft.createComplexArray();
-  const invInput = [];
-  for (let i = 0; i < N_FFT; i++) invInput.push(invRe[i], invIm[i]);
-  fft.inverseTransform(invOut, invInput);
+  ifft(re, im); // Обратное FFT
 
-  // Сдвигаем на N_FFT/2 (modeling delay) и применяем окно Ханна
-  const fir = new Float32Array(N_FFT);
-  const delay = N_FFT / 2;
-  for (let i = 0; i < N_FFT; i++) {
-    const win = 0.5 * (1 - Math.cos(2 * Math.PI * i / (N_FFT - 1)));
-    fir[i] = invOut[i * 2] * win;
-  }
-  
-  // Сдвиг вправо для причинности
+  // Сдвигаем на N_FFT/2 (modeling delay) и применяем окно
   const shiftedFir = new Float32Array(N_FFT);
-  for (let i = 0; i < N_FFT - delay; i++) {
-    shiftedFir[i + delay] = fir[i];
+  const delay = N_FFT / 2;
+  
+  for (let i = 0; i < N_FFT; i++) {
+    // Окно Ханна
+    const win = 0.5 * (1 - Math.cos(2 * Math.PI * i / (N_FFT - 1)));
+    
+    // Циклический сдвиг (чтобы импульс был в центре)
+    const origIdx = (i - delay + N_FFT) % N_FFT;
+    shiftedFir[i] = re[origIdx] * win;
   }
 
-  // Рисуем
   drawPlots(irSegment, shiftedFir);
   statusText.textContent = 'Готово! FIR рассчитан.';
 }
 
-// Запуск измерения
+// ==========================================
+// ЗАПУСК ИЗМЕРЕНИЯ
+// ==========================================
 async function startMeasurement() {
   try {
     measureBtn.disabled = true;
@@ -221,7 +258,6 @@ async function startMeasurement() {
       stream.getTracks().forEach(track => track.stop());
 
       const dataArray = new Float32Array(recordedData);
-      // Находим начало записи
       let startIdx = dataArray.findIndex(v => Math.abs(v) > 0.01);
       if(startIdx > 0) startIdx = Math.max(0, startIdx - 500);
       else startIdx = 0;
